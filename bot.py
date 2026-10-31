@@ -30,7 +30,6 @@ def run_flask():
 
 # 2. Pattern Matching
 def clean_and_extract_code(text: str) -> str | None:
-    # Match standard DTDC patterns: 1 letter followed by 8 to 11 digits
     compact = re.sub(r"[^A-Za-z0-9]", "", text).upper()
     match = re.search(r"([A-Z]\d{8,11})", compact)
     if match:
@@ -39,72 +38,80 @@ def clean_and_extract_code(text: str) -> str | None:
 
 def extract_from_image(image_bytes: bytes) -> str | None:
     """Processes image across 4 rotation angles with contrast enhancement."""
-    base_img = Image.open(io.BytesIO(image_bytes)).convert("L")
-    base_img = ImageOps.autocontrast(base_img)
-    base_img = ImageEnhance.Sharpness(base_img).enhance(2.0)
+    try:
+        base_img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        base_img = ImageOps.autocontrast(base_img)
+        base_img = ImageEnhance.Sharpness(base_img).enhance(2.0)
 
-    # Test 0, 90, 180, 270 degrees in case photo was taken vertically/sideways
-    for angle in [0, 90, 270, 180]:
-        rotated = base_img.rotate(angle, expand=True)
-        # psm 11 detects sparse text in no particular order
-        extracted_text = pytesseract.image_to_string(rotated, config="--psm 11")
-        found = clean_and_extract_code(extracted_text)
-        if found:
-            return found
-
+        for angle in [0, 90, 270, 180]:
+            rotated = base_img.rotate(angle, expand=True)
+            extracted_text = pytesseract.image_to_string(rotated, config="--psm 11")
+            found = clean_and_extract_code(extracted_text)
+            if found:
+                return found
+    except Exception as e:
+        print(f"OCR Error: {e}")
     return None
 
-# 3. Live DTDC Tracking Engine
+# 3. Live DTDC Tracking Engine via TrackCourier.io
+TRACKCOURIER_API_KEY = os.environ.get(
+    "TRACKCOURIER_API_KEY",
+    "tc_live_U4AOaSNeOqClGF-z1FB7laq6cvah_ynPA9TZxhpCzL0"
+)
+
 def fetch_dtdc_live_status(tracking_no: str) -> str:
+    url = f"https://api.trackcourier.io/v1/track?courier=dtdc&tracking_number={tracking_no}"
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://swytch.dtdc.com/track/",
-        "Origin": "https://swytch.dtdc.com"
+        "X-API-Key": TRACKCOURIER_API_KEY
     }
 
-    portal_url = "https://www.dtdc.in/tracking.asp"
-    swytch_url = "https://swytch.dtdc.com/track/"
-    status_summary = None
-    latest_event = None
-
     try:
-        # Swytch public endpoint for AWB tracking
-        api_url = f"https://swytch.dtdc.com/api/shipment/track/awb/{tracking_no}"
-        resp = requests.get(api_url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code != 200:
+            return (
+                f"📦 *Consignment No:* `{tracking_no}`\n\n"
+                f"⚠️ *Tracking service error (Status {resp.status_code}).* Please try again shortly."
+            )
 
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, dict):
-                # Retrieve top-level or checkpoint status
-                status_summary = data.get("currentStatus") or data.get("status")
-                history = data.get("trackingDetails") or data.get("events") or []
-                if history and isinstance(history, list):
-                    latest_event = history[-1].get("description") or history[-1].get("status")
-    except Exception:
-        pass
+        data = resp.json()
+        if not data.get("success"):
+            error_msg = data.get("message", "No tracking information found.")
+            return (
+                f"📦 *Consignment No:* `{tracking_no}`\n\n"
+                f"ℹ️ *{error_msg}*"
+            )
 
-    if status_summary or latest_event:
-        current = status_summary or latest_event
-        return (
-            f"📦 *Consignment No:* `{tracking_no}`\n"
-            f"📍 *Current Status:* **{current}**\n\n"
-            f"🔗 *Full Checkpoint Details:*\n"
-            f"• [DTDC Official Portal]({portal_url})\n"
-            f"• [DTDC Swytch Tracker]({swytch_url})"
-        )
-    else:
-        return (
-            f"📦 *Consignment No:* `{tracking_no}`\n\n"
-            f"ℹ️ *No immediate live API response for this consignment ID.*\n\n"
-            f"Check directly on the official tracking portals:\n"
-            f"• [DTDC Official Portal]({portal_url})\n"
-            f"• [DTDC Swytch Tracker]({swytch_url})\n\n"
-            f"Select *AWB / Consignment* and enter: `{tracking_no}`"
-        )
+        pkg_data = data.get("data", {})
+        status = pkg_data.get("status", "IN TRANSIT").upper()
+        estimated_delivery = pkg_data.get("estimated_delivery")
+        checkpoints = pkg_data.get("checkpoints", [])
+
+        lines = [
+            f"📦 *Consignment No:* `{tracking_no}`",
+            f"📍 *Status:* **{status}**"
+        ]
+
+        if estimated_delivery:
+            lines.append(f"🗓️ *Estimated Delivery:* {estimated_delivery}")
+
+        if checkpoints:
+            lines.append("\n🕒 *Recent Milestones:*")
+            # Show up to last 4 checkpoints (newest first)
+            for cp in reversed(checkpoints[-4:]):
+                dt = cp.get("date") or cp.get("time") or ""
+                desc = cp.get("status") or cp.get("activity") or "Update"
+                loc = cp.get("location")
+                loc_text = f" ({loc})" if loc else ""
+                lines.append(f"• `{dt}`: {desc}{loc_text}")
+        else:
+            lines.append("\nℹ️ Tracking record initialized. Detailed milestones are pending.")
+
+        return "\n".join(lines)
+
+    except requests.exceptions.Timeout:
+        return f"📦 *Consignment No:* `{tracking_no}`\n\n⏱️ Request timed out connecting to the courier network."
+    except Exception as e:
+        return f"📦 *Consignment No:* `{tracking_no}`\n\n⚠️ Error processing request: `{str(e)}`"
 
 # 4. Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -152,10 +159,18 @@ def main():
     if not token:
         raise ValueError("BOT_TOKEN environment variable not set!")
 
+    # Reset any active webhook before starting polling to avoid 409 Conflict
+    try:
+        requests.get(f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=true", timeout=5)
+    except Exception:
+        pass
+
+    # Start Flask keep-alive server
     web_thread = threading.Thread(target=run_flask)
     web_thread.daemon = True
     web_thread.start()
 
+    # Build and launch bot
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
