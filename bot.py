@@ -66,52 +66,92 @@ def fetch_dtdc_live_status(tracking_no: str) -> str:
     }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=12)
+        resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
             return (
                 f"📦 *Consignment No:* `{tracking_no}`\n\n"
-                f"⚠️ *Tracking service error (Status {resp.status_code}).* Please try again shortly."
+                f"⚠️ *Tracking service returned HTTP {resp.status_code}*. Please try again shortly."
             )
 
-        data = resp.json()
-        if not data.get("success"):
-            error_msg = data.get("message", "No tracking information found.")
-            return (
-                f"📦 *Consignment No:* `{tracking_no}`\n\n"
-                f"ℹ️ *{error_msg}*"
-            )
+        res_json = resp.json()
+        if not res_json.get("success"):
+            error_msg = res_json.get("message") or res_json.get("error", {}).get("message", "No tracking information found.")
+            return f"📦 *Consignment No:* `{tracking_no}`\n\nℹ️ {error_msg}"
 
-        pkg_data = data.get("data", {})
-        status = pkg_data.get("status", "IN TRANSIT").upper()
-        estimated_delivery = pkg_data.get("estimated_delivery")
-        checkpoints = pkg_data.get("checkpoints", [])
+        # Support both wrapped and direct response shapes
+        data = res_json.get("data", res_json)
 
+        status = str(data.get("status", "IN TRANSIT")).upper().replace("_", " ")
+        most_recent = data.get("MostRecentStatus")
+        origin = data.get("OriginCity")
+        dest = data.get("DestinationCity")
+        expected = data.get("ExpectedDeliveryDate") or data.get("estimated_delivery")
+
+        # Header details
         lines = [
             f"📦 *Consignment No:* `{tracking_no}`",
             f"📍 *Status:* **{status}**"
         ]
 
-        if estimated_delivery:
-            lines.append(f"🗓️ *Estimated Delivery:* {estimated_delivery}")
+        if most_recent and most_recent != status:
+            lines.append(f"ℹ️ *Latest Update:* {most_recent}")
 
-        if checkpoints:
-            lines.append("\n🕒 *Recent Milestones:*")
-            # Show up to last 4 checkpoints (newest first)
-            for cp in reversed(checkpoints[-4:]):
-                dt = cp.get("date") or cp.get("time") or ""
-                desc = cp.get("status") or cp.get("activity") or "Update"
-                loc = cp.get("location")
-                loc_text = f" ({loc})" if loc else ""
-                lines.append(f"• `{dt}`: {desc}{loc_text}")
+        if origin or dest:
+            lines.append(f"🚚 *Route:* {origin or 'Origin'} ➔ {dest or 'Destination'}")
+
+        if expected:
+            lines.append(f"🗓️ *Expected Delivery:* {expected}")
+
+        # Checkpoints can be under checkpoints, events, scans, or history
+        checkpoints = (
+            data.get("checkpoints")
+            or data.get("events")
+            or data.get("scans")
+            or data.get("history")
+            or []
+        )
+
+        if checkpoints and isinstance(checkpoints, list):
+            lines.append("\n📋 *Full Tracking Timeline:*")
+            
+            for cp in checkpoints:
+                # Extract timestamp/date
+                dt = (
+                    cp.get("timestamp")
+                    or cp.get("date")
+                    or cp.get("time")
+                    or ""
+                ).replace("T", " ").replace("Z", "")
+                
+                # Extract event description & location
+                desc = (
+                    cp.get("status")
+                    or cp.get("activity")
+                    or cp.get("description")
+                    or cp.get("event")
+                    or "Update"
+                )
+                location = cp.get("location") or cp.get("city")
+                loc_badge = f" — *{location}*" if location else ""
+
+                if dt:
+                    lines.append(f"• `{dt}`: {desc}{loc_badge}")
+                else:
+                    lines.append(f"• {desc}{loc_badge}")
         else:
-            lines.append("\nℹ️ Tracking record initialized. Detailed milestones are pending.")
+            lines.append("\nℹ️ Detailed checkpoint logs have not been recorded yet.")
 
-        return "\n".join(lines)
+        message = "\n".join(lines)
+
+        # Telegram message length safety cap (4096 char limit)
+        if len(message) > 4000:
+            return message[:3950] + "\n\n... *(timeline truncated)*"
+        return message
 
     except requests.exceptions.Timeout:
         return f"📦 *Consignment No:* `{tracking_no}`\n\n⏱️ Request timed out connecting to the courier network."
     except Exception as e:
-        return f"📦 *Consignment No:* `{tracking_no}`\n\n⚠️ Error processing request: `{str(e)}`"
+        return f"📦 *Consignment No:* `{tracking_no}`\n\n⚠️ Error: `{str(e)}`"
 
 # 4. Telegram Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
